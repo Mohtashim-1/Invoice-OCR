@@ -1,4 +1,4 @@
-# 📄 Invoice OCR App for ERPNext
+# 📄 Invoice OCR App for ERPNext v15
 
 Automatically extract invoice data from scanned **PDF** or **image** files and generate Sales or Purchase Invoices in ERPNext using Tesseract OCR.
 
@@ -41,7 +41,7 @@ Install required system packages:
 
 ```bash
 sudo apt update
-sudo apt install -y poppler-utils tesseract-ocr
+sudo apt install -y poppler-utils tesseract-ocr tesseract-ocr-urd
 
 # Get the app from GitHub
 
@@ -53,7 +53,7 @@ source ~/frappe-bench/env/bin/activate
 pip install -r apps/invoice_ocr/requirements.txt
 
 # Or manually install requirements
-pip install pytesseract pdf2image Pillow PyPDF2
+pip install pytesseract pdf2image Pillow PyPDF2 easyocr opencv-python
 
 # Deactivate virtual enviroment
 deactivate

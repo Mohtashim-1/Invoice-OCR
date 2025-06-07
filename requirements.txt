@@ -5,3 +5,5 @@ PyPDF2
 poppler-utils
 fuzzywuzzy
 python-Levenshtein
+easyocr
+opencv-python

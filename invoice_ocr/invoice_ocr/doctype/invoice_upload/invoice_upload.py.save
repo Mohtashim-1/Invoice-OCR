@@ -32,10 +32,12 @@ class InvoiceUpload(Document):
 
         def preprocess_image(pil_img):
             img = np.array(pil_img.convert("RGB"))
-            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
             scaled = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
             clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(scaled)
+
             thresh = cv2.adaptiveThreshold(
                 enhanced, 255,
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -43,15 +45,25 @@ class InvoiceUpload(Document):
             )
             return thresh
 
+      # OCR logic with improved accuracy
         if file_path.endswith(".pdf"):
             images = convert_from_path(file_path, dpi=300)
             for img in images:
                 processed = preprocess_image(img)
-                text += pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
+                text += pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
+#		with open("/tmp/ocr_debug_output.txt", "a", encoding="utf-8") as f:
+#			f.write(text + "\n" + "="*80 + "\n")
+#	except Exception as e:
+ #   		frappe.log_error(frappe.get_traceback(), "Failed to write OCR debug log")
+		try:
+  with open("/tmp/ocr_debug_output.txt", "a", encoding="utf-8") as f:
+            f.write(text + "\n" + "="*80 + "\n")
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Failed to write OCR debug log")
         else:
             img = Image.open(file_path)
             processed = preprocess_image(img)
-            text = pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
+            text = pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
 
         items = self.extract_items(text)
         extracted_data = {
@@ -107,7 +119,7 @@ class InvoiceUpload(Document):
             frappe.db.commit()
             extracted["party"] = doc.name
 
-        self.db_set("party", extracted["party"])
+        self.db_set("party", extracted["party"])  # Safe update after submit
         self.extracted_data = json.dumps(extracted, indent=2)
         self.save()
 
@@ -182,71 +194,37 @@ class InvoiceUpload(Document):
         return item_code
 
     def extract_items(self, text):
-        items = []
-        # Simplified and robust item extraction
         lines = text.splitlines()
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            # Look for quantity pattern
-            qty_match = re.search(r'([\d,]+\.\d{3})\s*(kg|Units)', line)
-            if qty_match:
-                # Find description in previous lines
-                description = ""
-                j = i - 1
-                while j >= 0 and j >= i - 3:
-                    if lines[j].strip() and not re.search(r'QUANTITY|UNIT PRICE|AMOUNT|DESCRIPTION', lines[j], re.IGNORECASE):
-                        description = lines[j].strip()
-                        break
-                    j -= 1
-                
-                # Find rate in current or next lines
-                rate = None
-                rate_match = re.search(r'([\d,]+\.\d{3})(?!.*(?:kg|Units))', line)
-                if not rate_match:
-                    # Check next 2 lines for rate
-                    for k in range(i+1, min(i+3, len(lines))):
-                        rate_match = re.search(r'([\d,]+\.\d{3})', lines[k])
-                        if rate_match:
-                            rate = rate_match.group(1)
-                            break
-                else:
-                    rate = rate_match.group(1)
-                
-                if description and rate:
-                    try:
-                        items.append({
-                            "description": description,
-                            "qty": float(qty_match.group(1).replace(',', '')),
-                            "rate": float(rate.replace(',', ''))
-                        })
-                    except:
-                        pass
-            i += 1
+        items = []
+        pattern = re.compile(r"(.+?)\s+(\d+\.\d{1,2})\s+(\d+\.\d{1,2})\s+\$?(\d+\.\d{1,2})")
+
+        for line in lines:
+            match = pattern.search(line)
+            if match:
+                try:
+                    description = match.group(1).strip()
+                    qty = float(match.group(2))
+                    rate = float(match.group(3))
+                    items.append({
+                        "description": description,
+                        "qty": qty,
+                        "rate": rate
+                    })
+                except:
+                    continue
         return items
 
     def extract_party(self, text):
-        # Simplified party extraction
-        # 1. Look for Source field
-        source_match = re.search(r'Source:\s*([^\n|]+)', text, re.IGNORECASE)
-        if source_match:
-            return source_match.group(1).strip()
-        
-        # 2. Look for Payment Communication
-        payment_match = re.search(r'Payment\s+Communication:\s*([^\n]+)', text, re.IGNORECASE)
-        if payment_match:
-            return payment_match.group(1).strip()
-        
-        # 3. Look for Order number
-        order_match = re.search(r'Order\s*[#:]\s*([^\s]+)', text, re.IGNORECASE)
-        if order_match:
-            return order_match.group(1).strip()
-        
-        # 4. Look for Invoice number pattern
-        inv_match = re.search(r'Invoice\s+([A-Z]+/\d{4}/\d+)', text, re.IGNORECASE)
-        if inv_match:
-            return inv_match.group(1).strip()
-        
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if any(key.lower() in line.lower() for key in ["Customer Code", "Supplier Code", "Customer:", "Supplier:"]):
+                parts = line.split(":")
+                if len(parts) > 1 and parts[1].strip():
+                    return parts[1].strip()
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    if next_line:
+                        return next_line
         return None
 
 
@@ -254,35 +232,3 @@ class InvoiceUpload(Document):
 def extract_invoice(docname):
     doc = frappe.get_doc("Invoice Upload", docname)
     doc.extract_invoice()
-
-
-@frappe.whitelist()
-def debug_ocr_preview(docname):
-    doc = frappe.get_doc("Invoice Upload", docname)
-    file_path = get_file_path(doc.file)
-
-    def preprocess_image(pil_img):
-        img = np.array(pil_img.convert("RGB"))
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        scaled = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(scaled)
-        thresh = cv2.adaptiveThreshold(
-            enhanced, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 15, 10
-        )
-        return thresh
-
-    text = ""
-    if file_path.endswith(".pdf"):
-        images = convert_from_path(file_path, dpi=300)
-        for img in images:
-            processed = preprocess_image(img)
-            text += pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
-    else:
-        img = Image.open(file_path)
-        processed = preprocess_image(img)
-        text = pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
-
-    return text[:2000]  # Limit output to first 2000 characters
