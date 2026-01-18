@@ -1,6 +1,7 @@
 import frappe
 import json
 import pytesseract
+import re
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 from frappe.utils.file_manager import get_file_path
@@ -13,21 +14,124 @@ def create_invoice(name):
         frappe.throw("No OCR data extracted.")
     data = json.loads(doc.extracted_data)
 
-    if doc.party_type == "Supplier":
+    party_type = doc.party_type if doc.party_type in ("Supplier", "Customer") else "Supplier"
+    if party_type == "Supplier":
         pi = frappe.new_doc("Purchase Invoice")
         pi.supplier = doc.party
+        if doc.party and frappe.db.get_value("Supplier", doc.party, "disabled"):
+            frappe.db.set_value("Supplier", doc.party, "disabled", 0)
     else:
         pi = frappe.new_doc("Sales Invoice")
         pi.customer = doc.party
+        if doc.party and frappe.db.get_value("Customer", doc.party, "disabled"):
+            frappe.db.set_value("Customer", doc.party, "disabled", 0)
 
-    for item in data.get("items", []):
-        pi.append("items", {
-            "item_name": item.get("description"),
-            "qty": item.get("qty"),
-            "rate": item.get("rate"),
-        })
+    company = frappe.defaults.get_user_default("Company")
+    if company:
+        pi.company = company
+
+    def get_default_item_group():
+        if frappe.db.exists("Item Group", "All Item Groups"):
+            return "All Item Groups"
+        return (
+            frappe.db.get_value("Item Group", {"is_group": 0}, "name")
+            or frappe.db.get_value("Item Group", {}, "name")
+        )
+
+    def get_default_uom():
+        if frappe.db.exists("UOM", "Nos"):
+            return "Nos"
+        if frappe.db.exists("UOM", "Unit"):
+            return "Unit"
+        return frappe.db.get_value("UOM", {}, "name")
+
+    def get_or_create_item(description):
+        if not description:
+            return ""
+        existing = frappe.db.get_value("Item", {"item_name": description}, "name")
+        if existing:
+            if frappe.db.get_value("Item", existing, "disabled"):
+                frappe.db.set_value("Item", existing, "disabled", 0)
+            return existing
+
+        base = re.sub(r"[^A-Za-z0-9]+", " ", description).strip()
+        if not base:
+            base = "OCR Item"
+        base = base[:120].strip()
+        item_code = base
+        counter = 1
+        while frappe.db.exists("Item", item_code):
+            counter += 1
+            item_code = f"{base}-{counter}"
+
+        item = frappe.new_doc("Item")
+        item.item_code = item_code
+        item.item_name = description
+        item.item_group = get_default_item_group()
+        item.stock_uom = get_default_uom()
+        item.is_stock_item = 0
+        item.disabled = 0
+        item.insert(ignore_permissions=True)
+        return item.name
+
+    invoice_items = doc.get("invoice_upload_item") or []
+    if invoice_items:
+        for row in invoice_items:
+            item_code = row.item
+            if not item_code and row.ocr_description:
+                item_code = get_or_create_item(row.ocr_description)
+
+            item_row = {
+                "qty": row.qty,
+                "rate": row.rate,
+            }
+            if item_code:
+                item_row["item_code"] = item_code
+                item_row["uom"] = frappe.db.get_value("Item", item_code, "stock_uom") or get_default_uom()
+            else:
+                item_row["item_name"] = row.ocr_description
+                item_row["uom"] = get_default_uom()
+
+            pi.append("items", item_row)
+    else:
+        for item in data.get("items", []):
+            pi.append("items", {
+                "item_name": item.get("description"),
+                "qty": item.get("qty"),
+                "rate": item.get("rate"),
+                "uom": get_default_uom(),
+            })
 
     pi.posting_date = data.get("date")
+    if pi.doctype == "Purchase Invoice":
+        if not pi.get("bill_no"):
+            pi.bill_no = doc.name
+        if not pi.get("bill_date"):
+            pi.bill_date = doc.date or frappe.utils.nowdate()
+
+    for item in pi.items:
+        if not item.get("uom"):
+            item.uom = get_default_uom()
+
+    if pi.company:
+        default_expense_account = frappe.db.get_value(
+            "Company", pi.company, "default_expense_account"
+        )
+        default_payable = frappe.db.get_value(
+            "Company", pi.company, "default_payable_account"
+        )
+        default_receivable = frappe.db.get_value(
+            "Company", pi.company, "default_receivable_account"
+        )
+        if default_expense_account:
+            for item in pi.items:
+                if not item.get("expense_account"):
+                    item.expense_account = default_expense_account
+        if pi.doctype == "Purchase Invoice" and default_payable and not pi.get("credit_to"):
+            pi.credit_to = default_payable
+        if pi.doctype == "Sales Invoice" and default_receivable and not pi.get("debit_to"):
+            pi.debit_to = default_receivable
+
     pi.insert(ignore_permissions=True)
     return {"doctype": pi.doctype, "name": pi.name}
 
