@@ -348,6 +348,33 @@ class InvoiceUpload(Document):
 
             return None
 
+        def extract_items_from_qty_lines(lines_list):
+            results = []
+            last_english = ""
+            qty_uom_re = re.compile(r"(\d+(?:\.\d+)?)\s*(Pcs|PCS|EA|Pair|PAIR|Pkt|PKT|KG|Kg|Nos|NOS)\b", re.IGNORECASE)
+            for line in lines_list:
+                qty_match = qty_uom_re.search(line)
+                if re.search(r"[A-Za-z]", line) and not qty_match:
+                    last_english = line.strip()
+                if not qty_match or not last_english:
+                    continue
+                qty = self.parse_number(qty_match.group(1))
+                after = line[qty_match.end():]
+                rate_match = re.search(r"(\d+(?:\.\d+)?)", after)
+                rate = self.parse_number(rate_match.group(1)) if rate_match else None
+                if qty is None or rate is None:
+                    continue
+                desc = normalize_description(last_english)
+                if not desc:
+                    continue
+                results.append({
+                    "description": desc,
+                    "item_code": extract_item_code(desc),
+                    "qty": float(qty),
+                    "rate": float(rate),
+                })
+            return results
+
         for line in lines:
             stripped = line.strip()
             if not stripped:
@@ -384,6 +411,9 @@ class InvoiceUpload(Document):
                 if len(description_buffer) > 3:
                     description_buffer.pop(0)
 
+        fallback = extract_items_from_qty_lines(lines)
+        if len(fallback) > len(items):
+            return fallback
         return items
 
     def extract_party_from_text(self, text):
@@ -395,6 +425,8 @@ class InvoiceUpload(Document):
         def looks_like_company(value):
             lower = value.lower()
             if not re.search(r"[A-Za-z]", value):
+                return False
+            if any(word in lower for word in ("total amount", "balance due", "round off", "discount", "vat", "total (sar)", "amount before vat")):
                 return False
             if any(word in lower for word in ("jubail", "ksa", "saudi", "arabia", "eastern", "province", "country", "city", "street", "po.box", "po box", "building")):
                 return False
@@ -425,6 +457,19 @@ class InvoiceUpload(Document):
             match = re.search(r"\b(M/S|MS)\s*([A-Za-z][A-Za-z\s&.\-]{4,})", value)
             if match:
                 return f"M/S {match.group(2).strip(' -:')}"
+            return ""
+
+        def prefer_supplier_brand(lines_subset):
+            for line in lines_subset:
+                lower = line.lower()
+                if "gulf pipe" in lower or "pipe supply" in lower:
+                    candidate = clean_party_line(line.strip())
+                    if looks_like_company(candidate):
+                        return extract_english_company(candidate)
+                if "techno zone" in lower:
+                    candidate = clean_party_line(line.strip())
+                    if looks_like_company(candidate):
+                        return extract_english_company(candidate)
             return ""
 
         def score_company(value):
@@ -480,6 +525,9 @@ class InvoiceUpload(Document):
                     return extract_english_company(candidate)
             return ""
         if self.party_type == "Supplier":
+            picked = prefer_supplier_brand(lines)
+            if picked:
+                return picked
             for line in lines:
                 lower = line.lower()
                 if "account name" in lower and ":" in line:
