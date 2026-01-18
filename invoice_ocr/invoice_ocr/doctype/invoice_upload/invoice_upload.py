@@ -454,7 +454,7 @@ class InvoiceUpload(Document):
             return value
 
         def extract_ms_company(value):
-            match = re.search(r"\b(M/S|MS)\s*([A-Za-z][A-Za-z\s&.\-]{4,})", value)
+            match = re.search(r"(M/S|MS)\s*([A-Za-z][A-Za-z\s&.\-]{4,})", value)
             if match:
                 return f"M/S {match.group(2).strip(' -:')}"
             return ""
@@ -505,6 +505,10 @@ class InvoiceUpload(Document):
         lines = text.splitlines()
         reversed_lines = list(reversed(lines))
         if self.party_type == "Customer":
+            for line in lines:
+                candidate = extract_ms_company(line)
+                if candidate:
+                    return candidate
             for line in lines:
                 if "to:" in line.lower():
                     value = line.split(":", 1)[1].strip() if ":" in line else ""
@@ -709,6 +713,18 @@ class InvoiceUpload(Document):
                 if self.party_type == "Customer":
                     party_doc.customer_name = self.party
                     party_doc.customer_type = "Company"
+                    party_doc.customer_group = (
+                        frappe.defaults.get_user_default("Customer Group")
+                        or frappe.db.get_value("Customer Group", {"is_group": 0}, "name")
+                        or "Commercial"
+                    )
+                    party_doc.territory = (
+                        frappe.defaults.get_user_default("Territory")
+                        or frappe.db.get_value("Territory", {"is_group": 0}, "name")
+                        or "All Territories"
+                    )
+                    if party_doc.meta.has_field("customer_code"):
+                        party_doc.customer_code = self.party[:140]
                 else:
                     party_doc.supplier_name = self.party
                     party_doc.supplier_type = "Company"
