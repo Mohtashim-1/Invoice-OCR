@@ -4,6 +4,8 @@ import pytesseract
 import re
 import requests
 import difflib
+import base64
+import io
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 from frappe.utils.file_manager import get_file_path
@@ -76,42 +78,215 @@ def extract_text_from_pdf(file_path):
 
 
 class InvoiceUpload(Document):
-    def get_gemini_config(self):
-        api_key = None
-        model = None
-        if frappe.db.exists("DocType", "Invoice OCR Settings"):
-            api_key = frappe.db.get_single_value("Invoice OCR Settings", "gemini_api_key") or api_key
-            model = frappe.db.get_single_value("Invoice OCR Settings", "gemini_model") or model
-        if frappe.db.exists("DocType", "DoppioBot Settings"):
-            api_key = frappe.db.get_single_value("DoppioBot Settings", "gemini_api_key") or api_key
-            model = frappe.db.get_single_value("DoppioBot Settings", "gemini_model") or model
-        api_key = api_key or frappe.conf.get("gemini_api_key")
-        model = model or frappe.conf.get("gemini_model") or "gemini-2.0-flash"
-        return api_key, model
-
-    def extract_with_gemini(self, text):
-        api_key, model = self.get_gemini_config()
-        if not api_key:
+    def _get_single_value_if_field_exists(self, doctype, fieldname):
+        if not frappe.db.exists("DocType", doctype):
             return None
+        try:
+            meta = frappe.get_meta(doctype)
+            if meta.has_field(fieldname):
+                return frappe.db.get_single_value(doctype, fieldname)
+        except Exception:
+            return None
+        return None
 
-        prompt = (
-            "Extract invoice data from the OCR text below. "
-            "Return ONLY valid JSON with keys: "
-            "party_name, invoice_no, date, currency, total, items. "
-            "items is a list of objects with keys: description, qty, rate, amount, item_code. "
-            "Use numbers for qty/rate/amount when possible, otherwise null. "
-            "If a value is missing, use null or empty string. "
-            "Do not include any markdown or explanation.\n\n"
-            f"OCR_TEXT:\n{text}"
+    def _build_invoice_prompt(self, text):
+        return (
+            "You are an invoice data extraction expert. "
+            "Extract data from the attached invoice image(s). The invoice may have MULTIPLE PAGES - examine ALL pages carefully. "
+            "OCR text below is noisy and should only be used as a secondary hint if image is unclear.\n\n"
+            "Return ONLY valid JSON (no markdown, no explanation) with these keys:\n"
+            "{\n"
+            '  "supplier_name": "the supplier/vendor company name from the invoice header",\n'
+            '  "invoice_no": "invoice number",\n'
+            '  "date": "invoice date",\n'
+            '  "currency": "currency code",\n'
+            '  "total": total_amount_number,\n'
+            '  "items": [\n'
+            '    {"description": "product/item name", "qty": number, "uom": "unit of measure (e.g. PCS, EA, KG, NOS, Pair, Roll, Pkt, Set, Mtr)", "rate": unit_price_number}\n'
+            "  ]\n"
+            "}\n\n"
+            "IMPORTANT RULES:\n"
+            "- Extract ALL line items from ALL pages of the invoice\n"
+            "- description = product/item name only, not codes or numbers\n"
+            "- qty = quantity as a number\n"
+            "- uom = unit of measure (PCS, EA, KG, NOS, Pair, Roll, Pkt, Set, Mtr, etc.)\n"
+            "- rate = unit price per item as a number\n"
+            "- Do NOT include totals, subtotals, VAT/tax rows, discounts, shipping, or summary lines\n"
+            "- supplier_name = the company that issued/sold on the invoice (NOT the buyer/customer)\n"
+            "- If a value is unclear, use null\n\n"
+            f"OCR_TEXT_HINT:\n{text}"
         )
 
+    def _clean_ocr_line(self, line):
+        if not line:
+            return ""
+        cleaned = re.sub(r"[\x00-\x1F\x7F]", " ", line)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        return cleaned
+
+    def _is_useful_ocr_line(self, line):
+        if not line:
+            return False
+        if len(line) < 5:
+            return False
+        tokens = re.findall(r"[A-Za-z0-9]+", line)
+        if len(tokens) < 2:
+            return False
+        # Skip mostly-symbol noise lines.
+        alpha_num = len(re.findall(r"[A-Za-z0-9]", line))
+        symbol = len(re.findall(r"[^A-Za-z0-9\s]", line))
+        if alpha_num and symbol > (alpha_num * 1.5):
+            return False
+        return True
+
+    def prepare_llm_input_text(self, text):
+        lines = [self._clean_ocr_line(line) for line in (text or "").splitlines()]
+        lines = [line for line in lines if line]
+        if not lines:
+            return ""
+
+        header_keywords = (
+            "tax invoice", "invoice no", "inv no", "inv date", "date",
+            "customer", "buyer", "supplier", "vat no", "vat",
+        )
+        header_lines = []
+        for line in lines[:140]:
+            lower = line.lower()
+            if not any(k in lower for k in header_keywords):
+                continue
+            if not re.search(r"\d", line):
+                continue
+            if self._is_useful_ocr_line(line):
+                header_lines.append(line)
+        header_lines = header_lines[:30]
+
+        start_idx = -1
+        for i, line in enumerate(lines):
+            lower = line.lower()
+            if ("description" in lower and "rate" in lower and ("qty" in lower or "quantity" in lower)) or (
+                "description of goods" in lower
+            ) or ("sl." in lower and "description" in lower and "rate" in lower):
+                start_idx = i
+                break
+
+        table_lines = []
+        stop_keywords = (
+            "amount in words", "grand total", "tax vat", "total taxes", "total / excluding vat",
+            "total discount", "balance due", "net amount",
+        )
+        uom_re = re.compile(r"\b(EA|PCS|Nos|NOS|KG|Kg|Pair|PAIR|Pkt|PKT|Roll|ROLL|Rol|ROL)\b")
+        money_re = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
+
+        if start_idx != -1:
+            for line in lines[start_idx:start_idx + 120]:
+                lower = line.lower()
+                if any(k in lower for k in stop_keywords):
+                    break
+                if not uom_re.search(line):
+                    continue
+                numeric_count = len(money_re.findall(line))
+                if numeric_count < 2:
+                    continue
+                if self._is_useful_ocr_line(line):
+                    table_lines.append(line)
+
+        if not table_lines:
+            # Fallback: keep only lines that look like item rows.
+            for line in lines[:250]:
+                if not uom_re.search(line):
+                    continue
+                if len(money_re.findall(line)) < 2:
+                    continue
+                if self._is_useful_ocr_line(line):
+                    table_lines.append(line)
+            table_lines = table_lines[:80]
+
+        focused = "INVOICE_HEADER:\n"
+        focused += "\n".join(header_lines[:30])
+        focused += "\n\nITEM_TABLE_TEXT:\n"
+        focused += "\n".join(table_lines[:100])
+        return focused[:12000]
+
+    def get_invoice_image_base64(self, file_path):
+        """Convert ALL pages of the PDF to base64 JPEG images."""
+        try:
+            pages = convert_from_path(file_path, dpi=200)
+            if not pages:
+                return None
+            result = []
+            for page in pages:
+                img = page.convert("RGB")
+                buffer = io.BytesIO()
+                img.save(buffer, format="JPEG", quality=80, optimize=True)
+                result.append(base64.b64encode(buffer.getvalue()).decode("utf-8"))
+            return result
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Invoice image conversion failed")
+            return None
+
+    def get_llm_config(self):
+        provider = "gemini"
+        gemini_api_key = None
+        gemini_model = None
+        claude_api_key = None
+        claude_model = None
+
+        provider = self._get_single_value_if_field_exists("Invoice OCR Settings", "llm_provider") or provider
+        gemini_api_key = self._get_single_value_if_field_exists("Invoice OCR Settings", "gemini_api_key") or gemini_api_key
+        gemini_model = self._get_single_value_if_field_exists("Invoice OCR Settings", "gemini_model") or gemini_model
+        claude_api_key = self._get_single_value_if_field_exists("Invoice OCR Settings", "claude_api_key") or claude_api_key
+        claude_model = self._get_single_value_if_field_exists("Invoice OCR Settings", "claude_model") or claude_model
+
+        gemini_api_key = self._get_single_value_if_field_exists("DoppioBot Settings", "gemini_api_key") or gemini_api_key
+        gemini_model = self._get_single_value_if_field_exists("DoppioBot Settings", "gemini_model") or gemini_model
+        provider = self._get_single_value_if_field_exists("DoppioBot Settings", "llm_provider") or provider
+        claude_api_key = self._get_single_value_if_field_exists("DoppioBot Settings", "claude_api_key") or claude_api_key
+        claude_model = self._get_single_value_if_field_exists("DoppioBot Settings", "claude_model") or claude_model
+
+        provider = (provider or frappe.conf.get("invoice_ocr_llm_provider") or "gemini").strip().lower()
+        gemini_api_key = gemini_api_key or frappe.conf.get("gemini_api_key")
+        gemini_model = gemini_model or frappe.conf.get("gemini_model") or "gemini-2.0-flash"
+        claude_api_key = claude_api_key or frappe.conf.get("claude_api_key") or frappe.conf.get("anthropic_api_key")
+        claude_model = claude_model or frappe.conf.get("claude_model") or frappe.conf.get("anthropic_model") or "claude-sonnet-4-5"
+
+        if provider == "claude":
+            if claude_api_key:
+                return provider, claude_api_key, claude_model
+            if gemini_api_key:
+                return "gemini", gemini_api_key, gemini_model
+            return provider, None, claude_model
+
+        if gemini_api_key:
+            return "gemini", gemini_api_key, gemini_model
+        if claude_api_key:
+            return "claude", claude_api_key, claude_model
+        return provider, None, gemini_model
+
+    def extract_with_gemini(self, text, image_b64=None):
+        provider, api_key, model = self.get_llm_config()
+        if provider != "gemini" or not api_key:
+            return None
+
+        prompt = self._build_invoice_prompt(text)
+
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        parts = []
+        if image_b64:
+            images = image_b64 if isinstance(image_b64, list) else [image_b64]
+            for img in images:
+                parts.append({
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": img,
+                    }
+                })
+        parts.append({"text": prompt})
         payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096},
         }
         try:
-            response = requests.post(url, json=payload, timeout=40)
+            response = requests.post(url, json=payload, timeout=120)
             response.raise_for_status()
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Gemini API request failed")
@@ -127,6 +302,94 @@ class InvoiceUpload(Document):
 
         parsed = self.parse_json_block(text_out)
         return parsed
+
+    def extract_with_claude(self, text, image_b64=None):
+        provider, api_key, model = self.get_llm_config()
+        frappe.logger().info(f"[Invoice OCR] Claude: provider={provider}, has_key={bool(api_key)}, model={model}")
+        if provider != "claude" or not api_key:
+            frappe.logger().info("[Invoice OCR] Claude skipped: provider not claude or no key")
+            return None
+
+        prompt = self._build_invoice_prompt(text)
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        # Build content: images first, then text prompt
+        content_blocks = []
+        if image_b64:
+            images = image_b64 if isinstance(image_b64, list) else [image_b64]
+            frappe.logger().info(f"[Invoice OCR] Sending {len(images)} page images to Claude")
+            for img in images:
+                content_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": img,
+                    },
+                })
+        content_blocks.append({"type": "text", "text": prompt})
+
+        payload = {
+            "model": model,
+            "max_tokens": 4096,
+            "temperature": 0.1,
+            "messages": [
+                {"role": "user", "content": content_blocks}
+            ],
+        }
+        try:
+            response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=120)
+            frappe.logger().info(f"[Invoice OCR] Claude API status: {response.status_code}")
+            if response.status_code != 200:
+                frappe.logger().error(f"[Invoice OCR] Claude API error body: {response.text[:2000]}")
+            response.raise_for_status()
+        except Exception as e:
+            frappe.log_error(frappe.get_traceback(), "Claude API request failed")
+            frappe.logger().error(f"[Invoice OCR] Claude API exception: {str(e)}")
+            return None
+
+        try:
+            data = response.json()
+            blocks = data.get("content", [])
+            text_blocks = [block.get("text", "") for block in blocks if block.get("type") == "text"]
+            text_out = "\n".join(text_blocks).strip()
+            frappe.logger().info(f"[Invoice OCR] Claude raw response length: {len(text_out)}")
+            frappe.logger().info(f"[Invoice OCR] Claude raw response preview: {text_out[:1000]}")
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Claude API response parse failed")
+            return None
+
+        parsed = self.parse_json_block(text_out)
+        if parsed:
+            frappe.logger().info(f"[Invoice OCR] Claude parsed OK, items count: {len(parsed.get('items', []))}")
+        else:
+            frappe.logger().error(f"[Invoice OCR] Claude JSON parse FAILED. Raw text: {text_out[:2000]}")
+        return parsed
+
+    def extract_with_llm(self, text, image_b64=None):
+        provider, api_key, _model = self.get_llm_config()
+        if not api_key:
+            return None, "ocr"
+
+        if provider == "claude":
+            parsed = self.extract_with_claude(text, image_b64=image_b64)
+            if parsed:
+                return parsed, "claude"
+            fallback = self.extract_with_gemini(text, image_b64=image_b64)
+            if fallback:
+                return fallback, "gemini"
+            return None, "ocr"
+
+        parsed = self.extract_with_gemini(text, image_b64=image_b64)
+        if parsed:
+            return parsed, "gemini"
+        fallback = self.extract_with_claude(text, image_b64=image_b64)
+        if fallback:
+            return fallback, "claude"
+        return None, "ocr"
 
     def parse_json_block(self, text):
         if not text:
@@ -159,6 +422,186 @@ class InvoiceUpload(Document):
         except Exception:
             return None
 
+    def is_noise_item(self, description, qty, rate):
+        desc = (description or "").strip()
+        if len(desc) < 4:
+            return True
+        if not re.search(r"[A-Za-z]", desc):
+            return True
+
+        lower = desc.lower()
+        noise_keywords = (
+            "seventy", "halala", "only", "amount in words", "total",
+            "balance due", "tax vat", "round off", "discount", "subtotal",
+            "invoice", "customer details", "buyer details",
+        )
+        if any(keyword in lower for keyword in noise_keywords):
+            return True
+
+        if qty is None or rate is None:
+            return True
+        if qty <= 0 or rate <= 0:
+            return True
+        if qty > 10000 or rate > 100000000:
+            return True
+
+        return False
+
+    def sanitize_items(self, items):
+        cleaned = []
+        seen = set()
+
+        for item in items or []:
+            description = re.sub(r"\s{2,}", " ", (item.get("description") or "")).strip(" -:|")
+            qty = self.parse_number(item.get("qty"))
+            rate = self.parse_number(item.get("rate"))
+            item_code = (item.get("item_code") or "").strip()
+            uom = (item.get("uom") or item.get("unit") or "").strip()
+
+            if self.is_noise_item(description, qty, rate):
+                continue
+
+            key = (
+                description.lower(),
+                round(float(qty), 4),
+                round(float(rate), 4),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+
+            cleaned.append({
+                "description": description,
+                "item_code": item_code,
+                "qty": float(qty),
+                "rate": float(rate),
+                "uom": uom,
+            })
+
+        return cleaned
+
+    def items_quality_score(self, items):
+        if not items:
+            return -999
+
+        score = 0.0
+        noise_keywords = ("amount", "words", "total", "vat", "discount", "balance", "invoice")
+        for row in items:
+            desc = (row.get("description") or "").strip()
+            qty = self.parse_number(row.get("qty"))
+            rate = self.parse_number(row.get("rate"))
+            if not desc:
+                score -= 4
+                continue
+
+            lower = desc.lower()
+            alpha_chars = len(re.findall(r"[A-Za-z]", desc))
+            symbol_chars = len(re.findall(r"[^A-Za-z0-9\s]", desc))
+            good_words = re.findall(r"\b[A-Za-z]{3,}\b", desc)
+            good_words_with_vowel = [w for w in good_words if re.search(r"[aeiouAEIOU]", w)]
+
+            row_score = 0.0
+            row_score += min(len(good_words_with_vowel), 6) * 0.6
+            row_score += 1.0 if qty and qty > 0 else -1.0
+            row_score += 1.0 if rate and rate > 0 else -1.0
+            if alpha_chars > 0:
+                row_score -= (symbol_chars / alpha_chars) * 1.5
+            if any(k in lower for k in noise_keywords):
+                row_score -= 1.5
+            if "copper" in lower or "coil" in lower:
+                row_score += 1.0
+            if len(desc) < 8:
+                row_score -= 0.8
+
+            score += row_score
+
+        # Small boost for plausible row count, but avoid favoring noisy long lists.
+        score += min(len(items), 4) * 0.3
+        return score
+
+    def pick_best_items(self, llm_items, ocr_items):
+        llm_items = self.sanitize_items(llm_items)
+        ocr_items = self.sanitize_items(ocr_items)
+
+        if llm_items and not ocr_items:
+            return llm_items, "llm"
+        if ocr_items and not llm_items:
+            return ocr_items, "ocr"
+        if not llm_items and not ocr_items:
+            return [], "ocr"
+
+        llm_score = self.items_quality_score(llm_items)
+        ocr_score = self.items_quality_score(ocr_items)
+
+        if llm_score >= ocr_score:
+            return llm_items, "llm"
+        return ocr_items, "ocr"
+
+    def extract_items_from_table_section(self, lines):
+        normalized_lines = [re.sub(r"\s{2,}", " ", (line or "").strip()) for line in lines if (line or "").strip()]
+        if not normalized_lines:
+            return []
+
+        start_idx = -1
+        for i, line in enumerate(normalized_lines):
+            lower = line.lower()
+            if ("description" in lower and "quantity" in lower and "rate" in lower) or (
+                "description of goods" in lower
+            ) or (
+                "sl" in lower and "description" in lower and "rate" in lower
+            ):
+                start_idx = i
+                break
+        if start_idx == -1:
+            return []
+
+        stop_keywords = (
+            "amount in words", "tax vat", "subtotal", "grand total", "balance due",
+            "total", "vat", "net", "discount", "round off",
+        )
+        uom_pattern = r"(?:EA|PCS|Nos|NOS|KG|Kg|Pair|PAIR|Pkt|PKT|Roll|ROLL|Rol|ROL)"
+
+        table_lines = []
+        for line in normalized_lines[start_idx + 1:]:
+            lower = line.lower()
+            if any(k in lower for k in stop_keywords):
+                break
+            table_lines.append(line)
+
+        items = []
+        buffer = ""
+        for line in table_lines:
+            work = line
+            if re.match(r"^\d+\s+", work):
+                work = re.sub(r"^\d+\s+", "", work)
+
+            # Merge wrapped description lines before pattern match
+            candidate = (buffer + " " + work).strip() if buffer else work
+            pattern = re.compile(
+                rf"^(?P<desc>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<uom>{uom_pattern})\b.*?\s+(?P<rate>\d+(?:,\d{{3}})*(?:\.\d+)?)\b",
+                re.IGNORECASE,
+            )
+            m = pattern.search(candidate)
+            if not m:
+                buffer = candidate if len(candidate) < 260 else ""
+                continue
+
+            desc = re.sub(r"\s{2,}", " ", m.group("desc")).strip(" -:|")
+            qty = self.parse_number(m.group("qty"))
+            rate = self.parse_number(m.group("rate"))
+            buffer = ""
+
+            if self.is_noise_item(desc, qty, rate):
+                continue
+            items.append({
+                "description": desc,
+                "item_code": extract_item_code(desc),
+                "qty": qty,
+                "rate": rate,
+            })
+
+        return self.sanitize_items(items)
+
     def normalize_items(self, items):
         normalized = []
         for item in items or []:
@@ -168,16 +611,23 @@ class InvoiceUpload(Document):
             qty = self.parse_number(item.get("qty"))
             rate = self.parse_number(item.get("rate"))
             item_code = (item.get("item_code") or "").strip()
+            uom = (item.get("uom") or item.get("unit") or "").strip()
             normalized.append({
                 "description": description,
                 "item_code": item_code,
                 "qty": qty or 1,
                 "rate": rate or 0,
+                "uom": uom,
             })
-        return normalized
+        return self.sanitize_items(normalized)
 
     def extract_items(self, text):
         lines = text.splitlines()
+
+        table_items = self.extract_items_from_table_section(lines)
+        if table_items:
+            return table_items
+
         items = []
         description_buffer = []
         skip_keywords = (
@@ -186,7 +636,10 @@ class InvoiceUpload(Document):
             "vat number", "cr number", "iban", "account", "bank", "tel", "fax",
             "email", "amount in words", "balance due", "discount", "round off",
             "total amount", "vat %", "nature of goods", "services", "u/price",
-            "qty", "sl.no", "ext amt", "vat amt", "unit", "disc"
+            "qty", "sl.no", "ext amt", "vat amt", "unit", "disc",
+            "addl", "addl no", "additional no", "building no", "zip code",
+            "city name", "district", "issue date", "invoice number", "po no",
+            "project name", "delivery date", "dn no", "buino", "bui no", "add.buino"
         )
         skip_locations = (
             "jubail", "ksa", "saudi", "arabia", "eastern province", "country",
@@ -200,6 +653,10 @@ class InvoiceUpload(Document):
             if any(keyword in lower for keyword in skip_locations):
                 return True
             if re.search(r"\b(st|street|road|rd|avenue|ave)\b", lower):
+                return True
+            if re.search(r"\badd\.?\s*bui\.?\s*no\b", lower):
+                return True
+            if re.search(r"\bbui\.?\s*no\b", lower):
                 return True
             if re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", lower):
                 return True
@@ -224,8 +681,10 @@ class InvoiceUpload(Document):
             working = re.sub(r"\s{2,}", " ", working).strip()
             working = re.sub(r"^\d+\s*[-.)]?\s+", "", working)
             working = re.sub(r"^\d+(?=[A-Za-z])", "", working)
+            if re.search(r"\badd\.?\s*bui\.?\s*no\b", working, re.IGNORECASE):
+                return None
 
-            uom_pattern = r"(?:Pcs|PCS|EA|Pair|PAIR|Pkt|PKT|KG|Kg|Nos|NOS)"
+            uom_pattern = r"(?:Pcs|PCS|EA|Pair|PAIR|Pkt|PKT|KG|Kg|Nos|NOS|Roll|ROLL|Rol|ROL)"
             qty_uom_attached = re.search(
                 rf"(\d+(?:\.\d+)?)\s*({uom_pattern})\b",
                 working,
@@ -306,8 +765,16 @@ class InvoiceUpload(Document):
             if tokens:
                 qty_idx = None
                 qty_val = None
+                spec_prefixes = {
+                    "sch", "cl", "class", "astm", "ansi", "api", "asme",
+                    "dn", "nps", "nb", "od", "id", "thk", "wt", "bw", "sw", "rf", "rtj"
+                }
                 for idx, token in enumerate(tokens):
                     if re.search(r"[A-Za-z]", token):
+                        continue
+                    if token.startswith(("-", "+")):
+                        continue
+                    if any(ch in token for ch in ("'", "\"")):
                         continue
                     if "/" in token:
                         continue
@@ -316,7 +783,11 @@ class InvoiceUpload(Document):
                         continue
                     if token.endswith("%"):
                         continue
-                    if "/" in token and "'" in token:
+                    prev_token = tokens[idx - 1] if idx > 0 else ""
+                    prev_alpha = re.sub(r"[^A-Za-z]", "", prev_token).lower()
+                    if prev_alpha in spec_prefixes:
+                        continue
+                    if prev_token.endswith("-"):
                         continue
                     if token.endswith("%"):
                         continue
@@ -351,7 +822,7 @@ class InvoiceUpload(Document):
         def extract_items_from_qty_lines(lines_list):
             results = []
             last_english = ""
-            qty_uom_re = re.compile(r"(\d+(?:\.\d+)?)\s*(Pcs|PCS|EA|Pair|PAIR|Pkt|PKT|KG|Kg|Nos|NOS)\b", re.IGNORECASE)
+            qty_uom_re = re.compile(r"(\d+(?:\.\d+)?)\s*(Pcs|PCS|EA|Pair|PAIR|Pkt|PKT|KG|Kg|Nos|NOS|Roll|ROLL|Rol|ROL)\b", re.IGNORECASE)
             for line in lines_list:
                 qty_match = qty_uom_re.search(line)
                 if re.search(r"[A-Za-z]", line) and not qty_match:
@@ -413,8 +884,8 @@ class InvoiceUpload(Document):
 
         fallback = extract_items_from_qty_lines(lines)
         if len(fallback) > len(items):
-            return fallback
-        return items
+            return self.sanitize_items(fallback)
+        return self.sanitize_items(items)
 
     def extract_party_from_text(self, text):
         def clean_party_line(value):
@@ -661,29 +1132,46 @@ class InvoiceUpload(Document):
 
 
     def extract_invoice(self):
+        debug = {}
         if not self.file:
             frappe.throw("No file attached.")
 
         file_path = get_file_path(self.file)
+        debug["file_path"] = file_path
+
         text = extract_text_from_pdf(file_path)
+        debug["ocr_text_length"] = len(text)
+        debug["ocr_text_preview"] = text[:3000]
 
         if not text.strip():
-            frappe.msgprint("⚠️ No OCR text found.")
-            return {"added_rows": []}
+            frappe.msgprint("No OCR text found.")
+            return {"added_rows": [], "debug": debug}
 
-        # ✅ Debug OCR preview
-        frappe.msgprint(f"<pre>{text[:4000]}</pre>")
+        # Keep it simple: send full OCR text to LLM.
+        text_for_llm = text[:50000]
+        image_b64 = self.get_invoice_image_base64(file_path)
+        debug["image_pages_count"] = len(image_b64) if isinstance(image_b64, list) else (1 if image_b64 else 0)
 
-        text_for_llm = text[:20000]
-        gemini_data = self.extract_with_gemini(text_for_llm)
+        llm_data, llm_source = self.extract_with_llm(text_for_llm, image_b64=image_b64)
+        debug["llm_source"] = llm_source
+        debug["llm_data_raw"] = llm_data
 
         extraction_source = "ocr"
-        if gemini_data:
-            extraction_source = "gemini"
-            items = self.normalize_items(gemini_data.get("items", []))
-            fallback_items = self.extract_items(text)
-            if fallback_items and len(fallback_items) > len(items):
-                items = fallback_items
+        items_source = "ocr"
+        if llm_data:
+            extraction_source = llm_source
+            debug["llm_items_raw"] = llm_data.get("items", [])
+            debug["llm_items_raw_count"] = len(llm_data.get("items", []))
+            llm_items = self.normalize_items(llm_data.get("items", []))
+            debug["llm_items_after_normalize"] = llm_items
+            debug["llm_items_after_normalize_count"] = len(llm_items)
+            if llm_items:
+                items = llm_items
+                items_source = "llm"
+            else:
+                debug["llm_items_empty_falling_back_to_ocr"] = True
+                items = self.sanitize_items(self.extract_items(text))
+                items_source = "ocr"
                 extraction_source = "ocr"
             if not self.party_type:
                 lower_text = text.lower()
@@ -694,11 +1182,13 @@ class InvoiceUpload(Document):
                 else:
                     self.party_type = "Supplier"
             if not self.party:
-                extracted_party = (gemini_data.get("party_name") or "").strip()
+                extracted_party = (llm_data.get("supplier_name") or llm_data.get("party_name") or "").strip()
+                debug["llm_supplier_name"] = extracted_party
                 if extracted_party:
                     self.party = extracted_party
         else:
-            items = self.extract_items(text)
+            debug["llm_data_is_null"] = True
+            items = self.sanitize_items(self.extract_items(text))
             if not self.party:
                 extracted_party = self.extract_party_from_text(text)
                 if extracted_party:
@@ -707,6 +1197,12 @@ class InvoiceUpload(Document):
             extracted_party = self.extract_party_from_text(text)
             if extracted_party:
                 self.party = extracted_party
+
+        debug["final_items_count"] = len(items)
+        debug["final_items"] = items
+        debug["final_items_source"] = items_source
+        debug["final_party"] = self.party
+        debug["final_party_type"] = self.party_type
         if self.party and self.party_type in ("Customer", "Supplier"):
             if not frappe.db.exists(self.party_type, self.party):
                 party_doc = frappe.new_doc(self.party_type)
@@ -732,13 +1228,16 @@ class InvoiceUpload(Document):
         extracted_data = {
             "items": items,
             "party": self.party,
+            "items_source": items_source,
+            "vision_input_used": bool(image_b64),
         }
-        if gemini_data:
+        if llm_data:
             extracted_data.update({
-                "invoice_no": gemini_data.get("invoice_no"),
-                "date": gemini_data.get("date"),
-                "total": gemini_data.get("total"),
-                "currency": gemini_data.get("currency"),
+                "supplier_name": llm_data.get("supplier_name") or self.party,
+                "invoice_no": llm_data.get("invoice_no"),
+                "date": llm_data.get("date"),
+                "total": llm_data.get("total"),
+                "currency": llm_data.get("currency"),
                 "extraction_source": extraction_source,
             })
         else:
@@ -799,9 +1298,28 @@ class InvoiceUpload(Document):
                 matched_item, match_score = find_fuzzy_match(row.get("description"))
             if not matched_item:
                 matched_item = self.get_or_create_item(row.get("description"))
+
+            # Resolve UOM - check if it exists in the system
+            raw_uom = (row.get("uom") or "").strip()
+            resolved_uom = ""
+            if raw_uom:
+                # Try exact match first
+                if frappe.db.exists("UOM", raw_uom):
+                    resolved_uom = raw_uom
+                else:
+                    # Try case-insensitive match
+                    found = frappe.db.get_value("UOM", {"name": ["like", raw_uom]}, "name")
+                    if found:
+                        resolved_uom = found
+                    else:
+                        resolved_uom = self.get_default_uom()
+            else:
+                resolved_uom = self.get_default_uom()
+
             self.append("invoice_upload_item", {
                 "ocr_description": row["description"][:140],
                 "qty": row["qty"],
+                "uom": resolved_uom,
                 "rate": row["rate"],
                 "item": matched_item
             })
@@ -810,6 +1328,7 @@ class InvoiceUpload(Document):
                 "matched_item": matched_item,
                 "match_score": round(match_score, 3) if match_score else 0,
                 "qty": row.get("qty"),
+                "uom": resolved_uom,
                 "rate": row.get("rate"),
                 "description": row.get("description"),
             })
@@ -820,10 +1339,10 @@ class InvoiceUpload(Document):
         self.save()
 
         if not items:
-            frappe.msgprint("⚠️ OCR done but no items found. Please check PDF format.")
+            frappe.msgprint("OCR done but no items found. Please check PDF format.")
         else:
-            frappe.msgprint("✅ OCR Extraction completed.")
-        return {"added_rows": added_rows, "items_count": len(items)}
+            frappe.msgprint(f"Extraction completed. {len(items)} items found via {items_source}.")
+        return {"added_rows": added_rows, "items_count": len(items), "debug": debug}
 
 
 @frappe.whitelist()

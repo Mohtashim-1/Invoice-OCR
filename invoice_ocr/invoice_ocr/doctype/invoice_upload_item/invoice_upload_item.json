@@ -9,6 +9,7 @@
   "ocr_description",
   "item",
   "qty",
+  "uom",
   "rate"
  ],
  "fields": [
@@ -30,21 +31,29 @@
    "options": "Item"
   },
   {
-   "fieldname": "rate",
-   "fieldtype": "Currency",
-   "in_list_view": 1,
-   "in_preview": 1,
-   "in_standard_filter": 1,
-   "label": "Rate",
-   "precision": "2"
-  },
-  {
    "fieldname": "qty",
    "fieldtype": "Float",
    "in_list_view": 1,
    "in_preview": 1,
    "in_standard_filter": 1,
    "label": "Quantity",
+   "precision": "2"
+  },
+  {
+   "fieldname": "uom",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_preview": 1,
+   "label": "UOM",
+   "options": "UOM"
+  },
+  {
+   "fieldname": "rate",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "in_preview": 1,
+   "in_standard_filter": 1,
+   "label": "Rate",
    "precision": "2"
   }
  ],
